@@ -1,0 +1,32 @@
+# filename=homebox-data.volume
+[Volume]
+Driver=local
+
+[Install]
+WantedBy=default.target
+---
+# filename=app.container
+
+[Container]
+Environment=HBOX_LOG_LEVEL=info
+Environment=HBOX_LOG_FORMAT=text
+Environment=HBOX_WEB_MAX_UPLOAD_SIZE=10
+Environment=HBOX_OPTIONS_ALLOW_ANALYTICS=false
+Image=ghcr.io/sysadminsmedia/homebox:latest
+Pod=homebox_pod.pod
+Volume=homebox-data.volume:/data/
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+---
+filename=homebox.pod
+
+[Pod]
+PublishPort=3100:7745
+
+[Install]
+WantedBy=default.target
+
