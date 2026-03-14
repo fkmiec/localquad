@@ -47,9 +47,11 @@ type Quadlet struct {
 
 // Global state
 var (
-	gRootful = false
-	gDryRun  = false
-	gVerbose = false
+	gRootful             = false
+	gDryRun              = false
+	gVerbose             = false
+	gInstallSubdirectory = true // Default to installing quadlets in a subdirectory to keep them organized
+	gInstallLinks        = true // Default to using symbolic links for installation to avoid file duplication and allow live updates
 )
 
 func main() {
@@ -78,7 +80,12 @@ func main() {
 		os.Exit(1)
 	}
 	if flag.NArg() > 1 {
-		searchDir = flag.Arg(1)
+		tmp := flag.Arg(1)
+		if info, err := os.Stat(tmp); err != nil || !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Error: %s is not a directory\n", tmp)
+			os.Exit(1)
+		}
+		searchDir, _ = filepath.Abs(tmp)
 	}
 
 	// 3. Discover, parse and resolve dependencies
@@ -343,38 +350,92 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 		os.Exit(1)
 	}
 
-	// 1. Copy main quadlet files
-	copiedFiles := []string{}
-	for _, q := range ordered {
-		dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
-		fmt.Printf(" Copying %s to %s\n", q.Filepath, dest)
-		if err := copyFile(q.Filepath, dest); err != nil {
-			fmt.Fprintf(os.Stderr, " Failed to copy: %v\n", err)
+	// Check config to determine if user prefers to deploy quadlets in folders to keep related quadlets together (default) or directly deploy to the target systemd folder.
+	if gInstallSubdirectory {
+		if gInstallLinks {
+			os.Symlink(sourceDir, filepath.Join(targetDir, filepath.Base(sourceDir)))
 		} else {
-			copiedFiles = append(copiedFiles, filepath.Base(q.Filepath))
-		}
+			dest := filepath.Join(targetDir, filepath.Base(sourceDir))
+			if err := os.MkdirAll(dest, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
+				os.Exit(1)
+			}
 
-		// Also copy drop-in directory if exists
-		dropInDir := q.Filepath + ".d"
-		if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
-			destDropIn := dest + ".d"
-			fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
-			if err := copyDir(dropInDir, destDropIn); err != nil {
-				fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
+			// Copy all quadlet files and their drop-in directories to the new directory
+			for _, q := range ordered {
+				src := q.Filepath
+				dest := filepath.Join(targetDir, filepath.Base(sourceDir), filepath.Base(q.Filepath))
+				fmt.Printf(" Copying %s to %s\n", src, dest)
+				if err := copyFile(src, dest); err != nil {
+					fmt.Fprintf(os.Stderr, " Failed to copy: %v\n", err)
+				}
+				// Also copy drop-in directory if exists
+				dropInDir := q.Filepath + ".d"
+				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+					destDropIn := dest + ".d"
+					fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
+					if err := copyDir(dropInDir, destDropIn); err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
+					}
+				}
+			}
+		}
+	} else {
+		// Install symbolic links to the target quadlet directory instead of copying the files.
+		if gInstallLinks {
+
+			fmt.Println("Using symbolic links for installation.")
+			for _, q := range ordered {
+				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+				fmt.Printf(" Linking %s to %s\n", q.Filepath, dest)
+				if err := os.Symlink(q.Filepath, dest); err != nil {
+					fmt.Fprintf(os.Stderr, " Failed to link: %v\n", err)
+				}
+
+				// Also copy drop-in directory if exists
+				dropInDir := q.Filepath + ".d"
+				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+					destDropIn := dest + ".d"
+					fmt.Printf(" Linking directory %s to %s\n", dropInDir, destDropIn)
+					if err := os.Symlink(dropInDir, destDropIn); err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to link dir: %v\n", err)
+					}
+				}
+			}
+
+		} else {
+			copiedFiles := []string{}
+			for _, q := range ordered {
+				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+				fmt.Printf(" Copying %s to %s\n", q.Filepath, dest)
+				if err := copyFile(q.Filepath, dest); err != nil {
+					fmt.Fprintf(os.Stderr, " Failed to copy: %v\n", err)
+				} else {
+					copiedFiles = append(copiedFiles, filepath.Base(q.Filepath))
+				}
+
+				// Also copy drop-in directory if exists
+				dropInDir := q.Filepath + ".d"
+				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+					destDropIn := dest + ".d"
+					fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
+					if err := copyDir(dropInDir, destDropIn); err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
+					}
+				}
 			}
 		}
 	}
-
 	// 2. Print systemd instructions
 	serviceNames := []string{}
-	for _, f := range copiedFiles {
-		ext := filepath.Ext(f)
+	for _, q := range ordered {
+		ext := filepath.Ext(q.Filepath)
 		if ext == ".kube" {
 			fmt.Fprintf(os.Stderr, "[INFO] .kube installs use the generic `podman-kube@` service\n")
 			continue
 		}
 		// Convert myapp.container to myapp.service
-		svc := strings.TrimSuffix(f, ext) + ".service"
+		svc := strings.TrimSuffix(q.Filepath, ext) + ".service"
 		serviceNames = append(serviceNames, svc)
 	}
 
@@ -384,7 +445,7 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 	}
 
 	fmt.Println("\n# --- SYSTEMD INSTRUCTIONS ---")
-	fmt.Println("# Files installed. Execute the following commands to enable via systemd:")
+	fmt.Println("# Quadlets installed. Execute the following commands to enable via systemd:")
 	fmt.Printf("\nsystemctl %sdaemon-reload\n", prefix)
 	if len(serviceNames) > 0 {
 		fmt.Printf("systemctl %senable --now %s\n", prefix, strings.Join(serviceNames, " "))
@@ -401,7 +462,30 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 
 	//If targetDir exists, remove files.
 	if info, err := os.Stat(targetDir); err == nil && info.IsDir() {
-		fmt.Printf("TO BE IMPLEMENTED: => Uninstalling quadlets from: %s\n", targetDir)
+		if gInstallSubdirectory {
+			if gInstallLinks {
+				//remove link to directory
+				_ = os.Remove(filepath.Join(targetDir, filepath.Base(sourceDir)))
+			} else {
+				//remove directory and all files within
+				_ = os.RemoveAll(filepath.Join(targetDir, filepath.Base(sourceDir)))
+			}
+		} else {
+			//remove individual files
+			for _, q := range ordered {
+				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+				if err := os.Remove(dest); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to remove %s: %v\n", dest, err)
+				}
+				// Also remove drop-in directory if exists
+				dropInDir := dest + ".d"
+				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+					if err := os.RemoveAll(dropInDir); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to remove drop-in dir %s: %v\n", dropInDir, err)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -410,17 +494,22 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 func discoverAndParseQuadlets(searchDir string) (map[string]*Quadlet, error) {
 	quadlets := make(map[string]*Quadlet)
 
-	err := filepath.WalkDir(searchDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if strings.HasSuffix(path, ".d") {
-				return filepath.SkipDir // Handled implicitly within parseQuadlet
-			}
-			return nil // Continue walking other dirs
-		}
+	if info, err := os.Stat(searchDir); err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("search path is not a directory: %s", searchDir)
+	}
 
+	dir, err := os.Open(searchDir)
+	if err != nil {
+		return nil, err
+	}
+	files, err := dir.Readdir(0)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, f := range files {
+		//fmt.Println(f.Name(), f.IsDir())
+		path := filepath.Join(searchDir, f.Name())
 		ext := filepath.Ext(path)
 		if extensions[ext] {
 			q, err := parseQuadlet(path)
@@ -430,13 +519,7 @@ func discoverAndParseQuadlets(searchDir string) (map[string]*Quadlet, error) {
 				quadlets[q.ID] = q
 			}
 		}
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
 	}
-
 	// 2nd pass: Extract dependencies (after all have IDs)
 	for _, q := range quadlets {
 		extractDependencies(q, quadlets)
