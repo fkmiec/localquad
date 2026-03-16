@@ -49,12 +49,15 @@ type Quadlet struct {
 
 // Global state
 var (
-	gRootful             = false
-	gDryRun              = false
-	gVerbose             = false
-	gInstallSubdirectory = true // Default to installing quadlets in a subdirectory to keep them organized
-	gInstallLinks        = true // Default to using symbolic links for installation to avoid file duplication and allow live updates
-	gReloadSystemd       = true // Default to reloading systemd after installation to apply changes immediately
+	gRootful                 = false
+	gDryRun                  = false
+	gVerbose                 = false
+	gInstallSubdirectory     = true  // Default to installing quadlets in a subdirectory to keep them organized
+	gInstallLinks            = false // Default to copying files for installation to avoid potential issues with source files being moved or deleted, but can be configured to use symbolic links for a more dynamic setup
+	gReloadSystemd           = true  // Default to reloading systemd after installation to apply changes immediately
+	gInstallReplace          = false // Default to NOT replacing existing installed quadlets. User can remove first or specifically configure to replace.
+	gUninstallRemoveVolumes  = true  // Default to removing volumes on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
+	gUninstallRemoveNetworks = true  // Default to removing networks on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
 )
 
 func main() {
@@ -398,99 +401,15 @@ func handlePull(quadlets map[string]*Quadlet) {
 
 func handleInstall(ordered []*Quadlet, sourceDir string) {
 	var targetDir string
+	prefix := "--user"
+
 	if gRootful {
 		targetDir = "/etc/containers/systemd"
+		prefix = ""
 	} else {
 		targetDir = filepath.Join(os.Getenv("HOME"), ".config/containers/systemd")
 	}
 
-	if gDryRun {
-		fmt.Printf("=> [DRY-RUN] Would install quadlets to: %s\n", targetDir)
-		return
-	}
-	fmt.Printf("=> Installing quadlets to: %s\n", targetDir)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating target directory: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Check config to determine if user prefers to deploy quadlets in folders to keep related quadlets together (default) or directly deploy to the target systemd folder.
-	if gInstallSubdirectory {
-		if gInstallLinks {
-			os.Symlink(sourceDir, filepath.Join(targetDir, filepath.Base(sourceDir)))
-		} else {
-			dest := filepath.Join(targetDir, filepath.Base(sourceDir))
-			if err := os.MkdirAll(dest, 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Copy all quadlet files and their drop-in directories to the new directory
-			for _, q := range ordered {
-				src := q.Filepath
-				dest := filepath.Join(targetDir, filepath.Base(sourceDir), filepath.Base(q.Filepath))
-				fmt.Printf(" Copying %s to %s\n", src, dest)
-				if err := copyFile(src, dest); err != nil {
-					fmt.Fprintf(os.Stderr, " Failed to copy: %v\n", err)
-				}
-				// Also copy drop-in directory if exists
-				dropInDir := q.Filepath + ".d"
-				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
-					destDropIn := dest + ".d"
-					fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
-					if err := copyDir(dropInDir, destDropIn); err != nil {
-						fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
-					}
-				}
-			}
-		}
-	} else {
-		// Install symbolic links to the target quadlet directory instead of copying the files.
-		if gInstallLinks {
-
-			fmt.Println("Using symbolic links for installation.")
-			for _, q := range ordered {
-				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
-				fmt.Printf(" Linking %s to %s\n", q.Filepath, dest)
-				if err := os.Symlink(q.Filepath, dest); err != nil {
-					fmt.Fprintf(os.Stderr, " Failed to link: %v\n", err)
-				}
-
-				// Also copy drop-in directory if exists
-				dropInDir := q.Filepath + ".d"
-				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
-					destDropIn := dest + ".d"
-					fmt.Printf(" Linking directory %s to %s\n", dropInDir, destDropIn)
-					if err := os.Symlink(dropInDir, destDropIn); err != nil {
-						fmt.Fprintf(os.Stderr, "  Failed to link dir: %v\n", err)
-					}
-				}
-			}
-
-		} else {
-			copiedFiles := []string{}
-			for _, q := range ordered {
-				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
-				fmt.Printf(" Copying %s to %s\n", q.Filepath, dest)
-				if err := copyFile(q.Filepath, dest); err != nil {
-					fmt.Fprintf(os.Stderr, " Failed to copy: %v\n", err)
-				} else {
-					copiedFiles = append(copiedFiles, filepath.Base(q.Filepath))
-				}
-
-				// Also copy drop-in directory if exists
-				dropInDir := q.Filepath + ".d"
-				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
-					destDropIn := dest + ".d"
-					fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
-					if err := copyDir(dropInDir, destDropIn); err != nil {
-						fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
-					}
-				}
-			}
-		}
-	}
-	// 2. Print systemd instructions
 	serviceNames := []string{}
 	for _, q := range ordered {
 		ext := filepath.Ext(q.Filepath)
@@ -510,69 +429,218 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 		serviceNames = append(serviceNames, svc)
 	}
 
-	prefix := ""
-	if !gRootful {
-		prefix = "--user"
-	}
-
 	reloadCmd := []string{"systemctl", prefix, "daemon-reload"}
 	var startCmd []string
 	if len(serviceNames) > 0 {
 		startCmd = append(startCmd, "systemctl", prefix, "start")
 		startCmd = append(startCmd, serviceNames...)
 	}
+
+	if gDryRun {
+		fmt.Printf("=> [DRY-RUN] Would install quadlets to: %s\n", targetDir)
+		if gInstallSubdirectory {
+			if gInstallLinks {
+				fmt.Printf("  Would create symbolic link: %s -> %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)), sourceDir)
+			} else {
+				fmt.Printf("  Would copy files to: %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)))
+			}
+			return
+		} else {
+			if gInstallLinks {
+				for _, q := range ordered {
+					dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+					fmt.Printf("  Would create symbolic link: %s -> %s\n", dest, q.Filepath)
+				}
+			} else {
+				for _, q := range ordered {
+					dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+					fmt.Printf("  Would copy %s to %s\n", q.Filepath, dest)
+				}
+			}
+		}
+		if gReloadSystemd {
+			fmt.Printf("  Would reload systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
+		}
+		return
+	}
+
+	fmt.Printf("=> Installing quadlets to: %s\n", targetDir)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating target directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Use links if configured to do so
+	if gInstallLinks {
+		fmt.Println("Using symbolic links for installation.")
+		if gInstallSubdirectory {
+			// Link the entire source directory as a subdirectory in the target location to keep related quadlets together
+			os.Symlink(sourceDir, filepath.Join(targetDir, filepath.Base(sourceDir)))
+		} else {
+			// Link the individual quadlet files directly into the target location
+			for _, q := range ordered {
+				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+				fmt.Printf(" Linking %s to %s\n", q.Filepath, dest)
+				if err := os.Symlink(q.Filepath, dest); err != nil {
+					fmt.Fprintf(os.Stderr, " Failed to link: %v\n", err)
+				}
+
+				// Also link drop-in directory if exists
+				dropInDir := q.Filepath + ".d"
+				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+					destDropIn := dest + ".d"
+					fmt.Printf(" Linking directory %s to %s\n", dropInDir, destDropIn)
+					if err := os.Symlink(dropInDir, destDropIn); err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to link dir: %v\n", err)
+					}
+				}
+			}
+		}
+		// Otherwise copy files to the target directory using podman quadlet install
+	} else {
+		var destDropIn string
+
+		//Use podman quadlet install if copying files
+		if gInstallReplace {
+			cmd := []string{"podman", "quadlet", "install", "--replace", sourceDir}
+			_ = runCommandSilently(cmd)
+		} else {
+			cmd := []string{"podman", "quadlet", "install", sourceDir}
+			_ = runCommandSilently(cmd)
+		}
+
+		// If the user configured to use a subdirectory to organize quadlets, we create the directory and move files after podman quadlet install step.
+		if gInstallSubdirectory {
+
+			//Create the subdirectory at target location
+			dest := filepath.Join(targetDir, filepath.Base(sourceDir))
+			if err := os.MkdirAll(dest, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Podman quadlet install does not support the subdirectory, so we have to move the quadlet files into it.
+			for _, q := range ordered {
+				src := filepath.Join(targetDir, filepath.Base(q.Filepath))
+				dest := filepath.Join(targetDir, filepath.Base(sourceDir), filepath.Base(q.Filepath))
+				fmt.Printf(" Moving %s to %s\n", src, dest)
+				if err := os.Rename(src, dest); err != nil {
+					fmt.Fprintf(os.Stderr, " Failed to move: %v\n", err)
+				}
+			}
+		}
+		// Copy drop-in directories if exist
+		for _, q := range ordered {
+			dropInDir := q.Filepath + ".d"
+			if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+
+				// Set dropInDir
+				if gInstallSubdirectory {
+					destDropIn = filepath.Join(targetDir, filepath.Base(sourceDir), filepath.Base(q.Filepath)+".d")
+				} else {
+					destDropIn = filepath.Join(targetDir, filepath.Base(q.Filepath)+".d")
+				}
+				fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
+				if err := copyDir(dropInDir, destDropIn); err != nil {
+					fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
+				}
+			}
+		}
+	}
+
 	if gReloadSystemd {
 		fmt.Printf("\n=> Reloading systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
 		_ = runCommand(reloadCmd)
 	}
-
 	fmt.Println("\n# --- SYSTEMD INSTRUCTIONS ---")
 	fmt.Println("# Quadlets installed. Execute the following commands to enable via systemd:")
 	if !gReloadSystemd {
 		fmt.Printf("\n%s\n", strings.Join(reloadCmd, " "))
 	}
 	fmt.Printf("\n%s\n", strings.Join(startCmd, " "))
-
 }
 
 func handleUninstall(ordered []*Quadlet, sourceDir string) {
 	var targetDir string
+	prefix := "--user"
 	if gRootful {
 		targetDir = "/etc/containers/systemd"
+		prefix = ""
 	} else {
 		targetDir = filepath.Join(os.Getenv("HOME"), ".config/containers/systemd")
 	}
 
-	//If targetDir exists, remove files.
-	if info, err := os.Stat(targetDir); err == nil && info.IsDir() {
-		if gInstallSubdirectory {
-			if gInstallLinks {
-				//remove link to directory
-				_ = os.Remove(filepath.Join(targetDir, filepath.Base(sourceDir)))
+	reloadCmd := []string{"systemctl", prefix, "daemon-reload"}
+
+	if gDryRun {
+		fmt.Printf("=> [DRY-RUN] Would uninstall quadlets from: %s\n", targetDir)
+		if gInstallLinks {
+			if gInstallSubdirectory {
+				fmt.Printf("  Would remove symbolic link: %s -> %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)), sourceDir)
 			} else {
-				//remove directory and all files within
-				_ = os.RemoveAll(filepath.Join(targetDir, filepath.Base(sourceDir)))
-			}
-		} else {
-			//remove individual files
-			for _, q := range ordered {
-				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
-				if err := os.Remove(dest); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to remove %s: %v\n", dest, err)
+				for _, q := range ordered {
+					dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+					fmt.Printf("  Would remove symbolic link: %s -> %s\n", dest, q.Filepath)
 				}
-				// Also remove drop-in directory if exists
-				dropInDir := dest + ".d"
-				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
-					if err := os.RemoveAll(dropInDir); err != nil {
-						fmt.Fprintf(os.Stderr, "Failed to remove drop-in dir %s: %v\n", dropInDir, err)
-					}
+			}
+			return
+		} else {
+			if gInstallSubdirectory {
+				fmt.Printf("  Would remove directory and all files from: %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)))
+			} else {
+				for _, q := range ordered {
+					dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+					fmt.Printf("  Would remove %s from %s\n", q.Filepath, dest)
 				}
 			}
 		}
+		if gReloadSystemd {
+			fmt.Printf("  Would reload systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
+		}
+		return
+	}
 
-		//Expressly remove volume and network resources that might be left behind if the user forgets to run 'podman volume rm' or 'podman network rm' for the resources defined in the quadlets, since they won't be automatically removed by systemd and could cause conflicts on re-installation.
+	//If targetDir exists, remove files.
+	if info, err := os.Stat(targetDir); err == nil && info.IsDir() {
+		if gInstallLinks {
+			if gInstallSubdirectory {
+				//remove link to directory
+				_ = os.Remove(filepath.Join(targetDir, filepath.Base(sourceDir)))
+			} else {
+				//remove individual file links
+				for _, q := range ordered {
+					dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
+					if err := os.Remove(dest); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to remove %s: %v\n", dest, err)
+					}
+					// Also remove link to drop-in directory if exists
+					dropInDir := dest + ".d"
+					if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
+						if err := os.Remove(dropInDir); err != nil {
+							fmt.Fprintf(os.Stderr, "Failed to remove symlink to drop-in dir %s: %v\n", dropInDir, err)
+						}
+					}
+				}
+			}
+		} else {
+			// Use podman quadlet rm to remove installed quadlets if files were copied to target location.
+			// quadctl always passes a directory to podman quadlet install, so all related quadlets are treated as one app and uninstalled if any are uninstalled.
+			cmd := []string{"podman", "quadlet", "rm", filepath.Base(ordered[0].Filepath)}
+			_ = runCommandSilently(cmd)
+			// podman quadlet install does not recognize the subdirectory, so we have to remove it separately after quadlets are removed.
+			if gInstallSubdirectory {
+				//remove directory and all files within
+				_ = os.RemoveAll(filepath.Join(targetDir, filepath.Base(sourceDir)))
+			}
+		}
+		if gReloadSystemd {
+			fmt.Printf("\n=> Reloading systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
+			_ = runCommand(reloadCmd)
+		}
+
+		//Expressly remove volume and network resources that might be left behind
 		for _, q := range ordered {
-			if q.Type == ".volume" {
+			if q.Type == ".volume" && gUninstallRemoveVolumes {
 				fmt.Printf("=> Removing volume %s...\n", q.ID)
 				//Default name has systemd- prefix. If non-default name was specified, use it, otherwise use default prefix.
 				if volName := q.Sections["Volume"]["VolumeName"]; volName != nil {
@@ -581,7 +649,7 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 					_ = runCommand([]string{"podman", "volume", "rm", "-f", "systemd-" + q.ID})
 				}
 			}
-			if q.Type == ".network" {
+			if q.Type == ".network" && gUninstallRemoveNetworks {
 				fmt.Printf("=> Removing network %s...\n", q.ID)
 				//Default name has systemd- prefix. If non-default name was specified, use it, otherwise use default prefix.
 				if networkName := q.Sections["Network"]["NetworkName"]; networkName != nil {
@@ -612,6 +680,40 @@ func discoverAndParseQuadlets(searchDir string) (map[string]*Quadlet, error) {
 		return nil, err
 	}
 
+	/*
+	   Proposed modification to support single file format (.quadlet):
+	   - Check for a .quadlet file extension (single file format for quadlets)
+	   - If find a .quadlet file, create temp directory and extract quadlets into separate files with their indicated filenames and extensions
+	   - Call discoverAndParseQuadlets recursively with the tempDir path
+	   - Either return immediately after recursive call or continue to check for additional .quadlet files in the original searchDir
+	   -   If continue processing, then you need to merge quadlet maps else will be overwriting quadlets from earlier processing.
+	*/
+	for _, f := range files {
+		//fmt.Println(f.Name(), f.IsDir())
+		path := filepath.Join(searchDir, f.Name())
+		ext := filepath.Ext(path)
+		if ".quadlet" == ext {
+			tempDir, err := parseDotQuadlet(path)
+			if err != nil {
+				return nil, err
+			}
+			tempQuadlets, err := discoverAndParseQuadlets(tempDir)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range tempQuadlets {
+				quadlets[k] = v
+			}
+		}
+	}
+	// Commenting out because assuming for now that any quadlet files should be processed.
+	// However, it might make more sense to return early if found .quadlet file since all
+	// related quadlets should be in the one file.
+	//
+	//if len(quadlets) > 0 {
+	//	return quadlets, nil
+	//}
+
 	for _, f := range files {
 		//fmt.Println(f.Name(), f.IsDir())
 		path := filepath.Join(searchDir, f.Name())
@@ -631,6 +733,81 @@ func discoverAndParseQuadlets(searchDir string) (map[string]*Quadlet, error) {
 	}
 
 	return quadlets, nil
+}
+
+// Split quadlets by "---" on a separate new line and find filenames specified as "# FileName=<name>"
+func parseDotQuadlet(path string) (string, error) {
+	// For simplicity, we will just extract the .quadlet file into a temp directory with the same name as the .quadlet file (without extension) in the system temp directory.
+	base := filepath.Base(path)
+	id := strings.TrimSuffix(base, ".quadlet")
+	tempDir := filepath.Join(os.TempDir(), id)
+
+	//fmt.Printf("Temp Dir for .quadlet: %s\n", tempDir)
+
+	// Create temp directory
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating temp directory: %v\n", err)
+		return "", err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	baseQuadletFilename := ""
+	quadletText := ""
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		//fmt.Println("READING: " + line)
+		if strings.HasPrefix(line, "#") && strings.Contains(strings.TrimSpace(line), "Filename") {
+			//fmt.Println("Found Filename...")
+			prop := strings.Split(line, "=")
+			if len(prop) > 1 {
+				baseQuadletFilename = strings.TrimSpace(prop[1])
+				//fmt.Println("Filename: " + baseQuadletFilename)
+				continue
+			}
+		}
+		// Save file when hit the separator
+		if "---" == strings.TrimSpace(line) {
+			//fmt.Println("SAVING file...")
+			err := writeFile(filepath.Join(tempDir, baseQuadletFilename), quadletText)
+			if err != nil {
+				return "", err
+			}
+			baseQuadletFilename = ""
+			quadletText = ""
+			continue
+		}
+		quadletText += line + "\n"
+	}
+
+	// Save file if reach end of .quadlet file with a filename and quadlet text
+	if len(baseQuadletFilename) > 0 && len(quadletText) > 0 {
+		//fmt.Println("SAVING FINAL FILE...")
+		err := writeFile(filepath.Join(tempDir, baseQuadletFilename), quadletText)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return tempDir, nil
+}
+
+func writeFile(path string, text string) error {
+	//fmt.Println("WRITING: \n" + text)
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(text)
+	return err
 }
 
 func parseQuadlet(path string) (*Quadlet, error) {
@@ -1130,7 +1307,7 @@ func getContainerPS(ordered []*Quadlet) ([][]string, error) {
 		}
 		//filter for containers that match our quadlet definitions by name or parent pod
 		for _, q := range ordered {
-			if q.Type == ".container" && q.GeneratedNames["container"] == parts[1] || (q.ParentPod != "" && q.ParentPod == parts[2]) {
+			if q.Type == ".container" && strings.HasSuffix(parts[1], q.GeneratedNames["container"]) || (q.ParentPod != "" && strings.HasSuffix(parts[2], q.ParentPod)) {
 				psInfo = append(psInfo, parts)
 				break
 			}
