@@ -1,0 +1,162 @@
+{
+  "Pod": {
+    "type": "Pod",
+    "sections": [
+      {
+        "type": "Pod",
+        "attributes": [
+          {
+            "type": "Name",
+            "quadlet-key": "QuadletName",
+            "podman-key": "PodmanName",
+            "values": [
+              {
+                "value": "value",
+                "description": "description",
+                "cautions": "caution1",
+                "validator": "validator"
+              },
+              {
+                "value": "value2",
+                "description": "description2",
+                "cautions": "caution2",
+                "validator": "validator2"
+              }
+            ],
+            "allow-multiple": false,
+            "quadlet-template": "some golang quadlet {{.}} template",
+            "podman-template": "some golang podman {{.}} template"
+          }
+        ]
+      }
+    ]
+  },
+  "Container": {
+    "type": "Container",
+    "sections": [
+      {
+        "type": "Container",
+        "attributes": [
+          {
+            "type": "Name",
+            "quadlet-key": "QuadletName",
+            "podman-key": "PodmanName",
+            "values": [
+              {
+                "value": "value",
+                "description": "description",
+                "cautions": "caution1",
+                "validator": "validator"
+              },
+              {
+                "value": "value2",
+                "description": "description2",
+                "cautions": "caution2",
+                "validator": "validator2"
+              }
+            ],
+            "allow-multiple": false,
+            "quadlet-template": "some golang quadlet {{.}} template",
+            "podman-template": "some golang podman {{.}} template"
+          }
+        ]
+      }
+    ]
+  },
+  "Volume": {
+    "type": "Volume",
+    "sections": [
+      {
+        "type": "Volume",
+        "attributes": [
+          {
+            "type": "Name",
+            "quadlet-key": "QuadletName",
+            "podman-key": "PodmanName",
+            "values": [
+              {
+                "value": "value",
+                "description": "description",
+                "cautions": "caution1",
+                "validator": "validator"
+              },
+              {
+                "value": "value2",
+                "description": "description2",
+                "cautions": "caution2",
+                "validator": "validator2"
+              }
+            ],
+            "allow-multiple": false,
+            "quadlet-template": "some golang quadlet {{.}} template",
+            "podman-template": "some golang podman {{.}} template"
+          }
+        ]
+      }
+    ]
+  },
+  "Network": {
+    "type": "Network",
+    "sections": [
+      {
+        "type": "Network",
+        "attributes": [
+          {
+            "type": "Name",
+            "quadlet-key": "QuadletName",
+            "podman-key": "PodmanName",
+            "values": [
+              {
+                "value": "value",
+                "description": "description",
+                "cautions": "caution1",
+                "validator": "validator"
+              },
+              {
+                "value": "value2",
+                "description": "description2",
+                "cautions": "caution2",
+                "validator": "validator2"
+              }
+            ],
+            "allow-multiple": false,
+            "quadlet-template": "some golang quadlet {{.}} template",
+            "podman-template": "some golang podman {{.}} template"
+          }
+        ]
+      }
+    ]
+  },
+  "Kube": {
+    "type": "Kube",
+    "sections": [
+      {
+        "type": "Kube",
+        "attributes": [
+          {
+            "type": "Name",
+            "quadlet-key": "QuadletName",
+            "podman-key": "PodmanName",
+            "values": [
+              {
+                "value": "value",
+                "description": "description",
+                "cautions": "caution1",
+                "validator": "validator"
+              },
+              {
+                "value": "value2",
+                "description": "description2",
+                "cautions": "caution2",
+                "validator": "validator2"
+              }
+            ],
+            "allow-multiple": false,
+            "quadlet-template": "some golang quadlet {{.}} template",
+            "podman-template": "some golang podman {{.}} template"
+          }
+        ]
+      }
+    ]
+  }
+}

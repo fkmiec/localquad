@@ -15,6 +15,7 @@ Environment=HBOX_OPTIONS_ALLOW_ANALYTICS=false
 Image=ghcr.io/sysadminsmedia/homebox:latest
 Pod=homebox.pod
 Volume=homebox-data.volume:/data/
+EnvironmentHost=true
 
 [Service]
 Restart=always
