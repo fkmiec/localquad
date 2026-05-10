@@ -1,5 +1,7 @@
 package schema
 
+import "text/template"
+
 // GenerateKubeOptions generates all kube schema options
 func GetKubeOptions() []SchemaOption {
 	options := []SchemaOption{
@@ -17,6 +19,13 @@ func GetKubeOptions() []SchemaOption {
 		optGlobalArgsKube(),
 		optContainersConfModuleKube(),
 	}
+
+	// Pre-parse templates for all options to catch errors early. Will panic if any template is invalid, which is desirable during development.
+	for _, option := range options {
+		option.QuadletTemplateParsed = template.Must(template.New("quadlet").Parse(option.QuadletTemplate))
+		option.PodmanTemplateParsed = template.Must(template.New("podman").Parse(option.PodmanTemplate))
+	}
+
 	return options
 }
 

@@ -1,2 +1,2 @@
 #!/bin/bash
-go build -o localquad main.go
+go build -o quadctl main.go

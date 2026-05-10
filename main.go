@@ -49,6 +49,11 @@ type Quadlet struct {
 	GeneratedNames map[string]string // Key: name type, Value: specific name (useful for ps filters)
 }
 
+type Option struct {
+	Key   string
+	Value string
+}
+
 // Global state
 var (
 	gRootful                 = false
@@ -60,7 +65,7 @@ var (
 	gInstallReplace          = false // Default to NOT replacing existing installed quadlets. User can remove first or specifically configure to replace.
 	gUninstallRemoveVolumes  = true  // Default to removing volumes on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
 	gUninstallRemoveNetworks = true  // Default to removing networks on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
-	quadletSchemas           = map[string]map[string]SchemaOption{}
+	quadletSchemas           map[string]map[string]SchemaOption
 )
 
 func assembleQuadletOptionsMap(options []SchemaOption) map[string]SchemaOption {
@@ -1083,20 +1088,24 @@ func generateCreateCommand(q *Quadlet) ([]string, []string) {
 					case "ServiceName":
 						continue // ServiceName is for systemd and does not affect Podman CLI
 					case "VolumeName":
-						cmd = append(cmd, "--name", v) // Not sure this is valid. May need to hold the value and append at the end after processing all options to avoid ordering issues with Podman CLI
+						//cmd = append(cmd, "--name", v) // Not sure this is valid. May need to hold the value and append at the end after processing all options to avoid ordering issues with Podman CLI
+						// The volume name is specified by the ID and added at the end of the command
 						continue
 					case "PodmanArgs": // Handled above
 						continue
 					default:
 						var buf bytes.Buffer
 						if opt, ok := options[k]; ok {
-							err := opt.PodmanTemplateParsed.Execute(&buf, v)
+							option := Option{Key: opt.PodmanKey, Value: v}
+							err := opt.PodmanTemplateParsed.Execute(&buf, option)
 							if err != nil {
 								warnings = append(warnings, fmt.Sprintf("Error formatting volume option %s: %v", k, err))
 								continue
 							}
 							formatted := buf.String()
-							cmd = append(cmd, formatted)
+							// Use Fields to parse space-separated flags
+							cmd = append(cmd, strings.Fields(formatted)...)
+
 						} else {
 							warnings = append(warnings, fmt.Sprintf("Quadlet volume option not defined: %s", k))
 						}
@@ -1129,13 +1138,15 @@ func generateCreateCommand(q *Quadlet) ([]string, []string) {
 					default:
 						var buf bytes.Buffer
 						if opt, ok := options[k]; ok {
-							err := opt.PodmanTemplateParsed.Execute(&buf, v)
+							option := Option{Key: opt.PodmanKey, Value: v}
+							err := opt.PodmanTemplateParsed.Execute(&buf, option)
 							if err != nil {
 								warnings = append(warnings, fmt.Sprintf("Error formatting network option %s: %v", k, err))
 								continue
 							}
 							formatted := buf.String()
-							cmd = append(cmd, formatted)
+							// Use Fields to parse space-separated flags
+							cmd = append(cmd, strings.Fields(formatted)...)
 						} else {
 							warnings = append(warnings, fmt.Sprintf("Quadlet network option not defined: %s", k))
 						}
@@ -1163,15 +1174,17 @@ func generateCreateCommand(q *Quadlet) ([]string, []string) {
 						continue // ServiceName is for systemd and does not affect Podman CLI
 					case "PodmanArgs": // Handled above
 					default:
-						var buf bytes.Buffer
+						buf := bytes.Buffer{}
 						if opt, ok := options[k]; ok {
-							err := opt.PodmanTemplateParsed.Execute(&buf, v)
+							option := Option{Key: opt.PodmanKey, Value: v}
+							err := opt.PodmanTemplateParsed.Execute(&buf, option)
 							if err != nil {
 								warnings = append(warnings, fmt.Sprintf("Error formatting pod option %s: %v", k, err))
 								continue
 							}
 							formatted := buf.String()
-							cmd = append(cmd, formatted)
+							// Use Fields to parse space-separated flags
+							cmd = append(cmd, strings.Fields(formatted)...)
 						} else {
 							warnings = append(warnings, fmt.Sprintf("Quadlet pod option not defined: %s", k))
 						}
@@ -1232,19 +1245,22 @@ func generateCreateCommand(q *Quadlet) ([]string, []string) {
 						cmd = append(cmd, "-v", mapped)
 					case "Network":
 						cmd = append(cmd, "--network", strings.TrimSuffix(v, ".network"))
-					case "Pod":
-						cmd = append(cmd, "--pod", strings.TrimSuffix(v, ".pod"))
 					case "PodmanArgs": // Handled above
 					default:
 						var buf bytes.Buffer
 						if opt, ok := options[k]; ok {
-							err := opt.PodmanTemplateParsed.Execute(&buf, v)
+							if k == "Pod" {
+								v = strings.TrimSuffix(v, ".pod")
+							}
+							option := Option{Key: opt.PodmanKey, Value: v}
+							err := opt.PodmanTemplateParsed.Execute(&buf, option)
 							if err != nil {
 								warnings = append(warnings, fmt.Sprintf("Error formatting container option %s: %v", k, err))
 								continue
 							}
 							formatted := buf.String()
-							cmd = append(cmd, formatted)
+							// Use Fields to parse space-separated flags
+							cmd = append(cmd, strings.Fields(formatted)...)
 						} else {
 							warnings = append(warnings, fmt.Sprintf("Quadlet container option not defined: %s", k))
 						}

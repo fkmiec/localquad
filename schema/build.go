@@ -1,5 +1,7 @@
 package schema
 
+import "text/template"
+
 // GenerateBuildOptions generates all build schema options
 func GetBuildOptions() []SchemaOption {
 	options := []SchemaOption{
@@ -33,6 +35,13 @@ func GetBuildOptions() []SchemaOption {
 		optGlobalArgsBuild(),
 		optContainersConfModuleBuild(),
 	}
+
+	// Pre-parse templates for all options to catch errors early. Will panic if any template is invalid, which is desirable during development.
+	for i, option := range options {
+		options[i].QuadletTemplateParsed = template.Must(template.New("quadlet").Parse(option.QuadletTemplate))
+		options[i].PodmanTemplateParsed = template.Must(template.New("podman").Parse(option.PodmanTemplate))
+	}
+
 	return options
 }
 

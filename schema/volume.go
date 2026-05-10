@@ -8,7 +8,7 @@ import (
 func GetVolumeOptions() []SchemaOption {
 	options := []SchemaOption{
 		optVolumeName(),
-		optDriver(),
+		optVolumeDriver(),
 		optCopy(),
 		optDevice(),
 		optType(),
@@ -23,9 +23,9 @@ func GetVolumeOptions() []SchemaOption {
 	}
 
 	// Pre-parse templates for all options to catch errors early. Will panic if any template is invalid, which is desirable during development.
-	for _, option := range options {
-		option.QuadletTemplateParsed = template.Must(template.New("quadlet").Parse(option.QuadletTemplate))
-		option.PodmanTemplateParsed = template.Must(template.New("podman").Parse(option.PodmanTemplate))
+	for i, option := range options {
+		options[i].QuadletTemplateParsed = template.Must(template.New("quadlet").Parse(option.QuadletTemplate))
+		options[i].PodmanTemplateParsed = template.Must(template.New("podman").Parse(option.PodmanTemplate))
 	}
 
 	return options
@@ -41,6 +41,21 @@ func optVolumeName() SchemaOption {
 		PodmanTemplate:  "{{.Value}}",
 		AllowMultiple:   false,
 		Values:          []OptionValue{},
+	}
+}
+
+func optVolumeDriver() SchemaOption {
+	return SchemaOption{
+		QuadletKey:      "Driver",
+		PodmanKey:       "--driver",
+		Description:     "Specify the volume driver name (default local). There are two drivers supported by Podman itself: local and image.",
+		QuadletTemplate: "{{.Key}}={{.Value}}",
+		PodmanTemplate:  "{{.Key}}={{.Value}}",
+		AllowMultiple:   false,
+		Values: []OptionValue{
+			{Value: "local", Description: "Use a directory on the host's disk as the backend."},
+			{Value: "image", Description: "Use an image as the volume source"},
+		},
 	}
 }
 
@@ -123,7 +138,7 @@ func optVolumeLabel() SchemaOption {
 	return SchemaOption{
 		QuadletKey:      "Label",
 		PodmanKey:       "--label",
-		Description:     "Set one or more OCI labels on the volume. Format: key=value. Similar to Environment. Can be specified multiple times.",
+		Description:     "Set one or more OCI labels on the volume. Format of the value is: key=value. Similar to Environment. Can be specified multiple times.",
 		QuadletTemplate: "{{.Key}}={{.Value}}",
 		PodmanTemplate:  "{{.Key}} {{.Value}}",
 		AllowMultiple:   true,
@@ -135,11 +150,18 @@ func optOptions() SchemaOption {
 	return SchemaOption{
 		QuadletKey:      "Options",
 		PodmanKey:       "--opt",
-		Description:     "Mount options to use for filesystem (used by mount command -o option).",
+		Description:     "Set driver specific options. For the default driver, local, this allows a volume to be configured to mount a filesystem on the host. For the local driver the following options are supported: type, device, o, and [no]copy. For the image driver, the only supported option is image, which specifies the image the volume is based on. This option is mandatory when using the image driver.",
 		QuadletTemplate: "{{.Key}}={{.Value}}",
 		PodmanTemplate:  "--opt o={{.Value}}",
 		AllowMultiple:   false,
-		Values:          []OptionValue{},
+		Values: []OptionValue{
+			{Value: "type=<filesystem_type>", Description: "The filesystem type of the device (used with mount command -t option)."},
+			{Value: "device=<device_path>", Description: "The path of a device to be mounted for the volume."},
+			{Value: "o=<mount_options>", Description: "Mount options to use for filesystem (used by mount command -o option)."},
+			{Value: "copy", Description: "Copy image content to volume."},
+			{Value: "nocopy", Description: "Do not copy content."},
+			{Value: "image=<image_name>", Description: "The image the volume is based on."},
+		},
 	}
 }
 
@@ -159,7 +181,7 @@ func optGlobalArgsVolume() SchemaOption {
 	return SchemaOption{
 		QuadletKey:      "GlobalArgs",
 		PodmanKey:       "podman",
-		Description:     "Arguments passed directly after 'podman' command.",
+		Description:     "Space-separated list of arguments passed directly after 'podman' command. e.g. --log-level=debug",
 		QuadletTemplate: "{{.Key}}={{.Value}}",
 		PodmanTemplate:  "{{.Value}}",
 		AllowMultiple:   true,
@@ -173,7 +195,7 @@ func optContainersConfModuleVolume() SchemaOption {
 		PodmanKey:       "--module",
 		Description:     "Load a containers.conf module. Can be specified multiple times.",
 		QuadletTemplate: "{{.Key}}={{.Value}}",
-		PodmanTemplate:  "{{.Key}} {{.Value}}",
+		PodmanTemplate:  "{{.Key}}={{.Value}}",
 		AllowMultiple:   true,
 		Values:          []OptionValue{},
 	}

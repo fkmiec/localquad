@@ -1,5 +1,7 @@
 package schema
 
+import "text/template"
+
 // GetPodOptions generates all pod schema options
 func GetPodOptions() []SchemaOption {
 	options := []SchemaOption{
@@ -28,6 +30,13 @@ func GetPodOptions() []SchemaOption {
 		optGlobalArgsPod(),
 		optContainersConfModulePod(),
 	}
+
+	// Pre-parse templates for all options to catch errors early. Will panic if any template is invalid, which is desirable during development.
+	for i, option := range options {
+		options[i].QuadletTemplateParsed = template.Must(template.New("quadlet").Parse(option.QuadletTemplate))
+		options[i].PodmanTemplateParsed = template.Must(template.New("podman").Parse(option.PodmanTemplate))
+	}
+
 	return options
 }
 
@@ -38,7 +47,7 @@ func optPodName() SchemaOption {
 		PodmanKey:       "--name",
 		Description:     "The (optional) name of the Podman pod. Default is systemd-<unitname> to avoid conflicts with user-managed pods.",
 		QuadletTemplate: "{{.Key}}={{.Value}}",
-		PodmanTemplate:  "{{.Key}} {{.Value}}",
+		PodmanTemplate:  "{{.Key}}={{.Value}}",
 		AllowMultiple:   false,
 		Values:          []OptionValue{},
 	}
@@ -50,7 +59,7 @@ func optServiceName() SchemaOption {
 		PodmanKey:       "service",
 		Description:     "By default, the systemd service unit is named by appending '-pod' to the unit name. Set this to override.",
 		QuadletTemplate: "{{.Key}}={{.Value}}",
-		PodmanTemplate:  "ServiceName={{.Value}}",
+		PodmanTemplate:  "",
 		AllowMultiple:   false,
 		Values:          []OptionValue{},
 	}
