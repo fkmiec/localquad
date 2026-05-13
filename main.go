@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"os"
 	"os/exec"
@@ -47,6 +48,7 @@ type Quadlet struct {
 	RestartPolicy  string            // [Service] Restart=
 	KubernetesYaml string            // Path to original YAML for .kube
 	GeneratedNames map[string]string // Key: name type, Value: specific name (useful for ps filters)
+	ServiceName    string            // The name of the systemd unit (from quadlet file or default to <id>-<type>)
 }
 
 type Option struct {
@@ -56,16 +58,23 @@ type Option struct {
 
 // Global state
 var (
-	gRootful                 = false
-	gDryRun                  = false
-	gVerbose                 = false
-	gInstallSubdirectory     = true  // Default to installing quadlets in a subdirectory to keep them organized
-	gInstallLinks            = false // Default to copying files for installation to avoid potential issues with source files being moved or deleted, but can be configured to use symbolic links for a more dynamic setup
-	gReloadSystemd           = true  // Default to reloading systemd after installation to apply changes immediately
-	gInstallReplace          = false // Default to NOT replacing existing installed quadlets. User can remove first or specifically configure to replace.
-	gUninstallRemoveVolumes  = true  // Default to removing volumes on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
-	gUninstallRemoveNetworks = true  // Default to removing networks on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
-	quadletSchemas           map[string]map[string]SchemaOption
+	isRootful         = false
+	isSystemd         = false
+	isPrintOnly       = false
+	isVerbose         = false
+	quadletsPath      = ""    // Path to the global directory containing quadlet folders or files
+	useSubdirectories = true  // Default to installing quadlets in a subdirectory to keep them organized
+	useSymbolicLinks  = false // Default to copying files for installation to avoid potential issues with source files being moved or deleted, but can be configured to use symbolic links for a more dynamic setup
+	isReloadSystemd   = true  // Default to reloading systemd after installation to apply changes immediately
+	gInstallReplace   = false // Default to NOT replacing existing installed quadlets. User can remove first or specifically configure to replace.
+	isRemoveVolumes   = true  // Default to removing volumes on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
+	isRemoveNetworks  = true  // Default to removing networks on uninstall since they are often not needed after uninstall and can be left behind if not removed, but can be configured to keep volumes for data persistence.
+	systemdStartTmpl  = template.Must(template.New("systemdStart").Parse("systemctl {{.user}} start"))
+	systemdStopTmpl   = template.Must(template.New("systemdStop").Parse("systemctl {{.user}} stop"))
+	systemdStatusTmpl = template.Must(template.New("systemdStatus").Parse("systemctl {{.user}} status"))
+	systemdReloadTmpl = template.Must(template.New("systemdReload").Parse("systemctl {{.user}} daemon-reload"))
+	systemdLogsTmpl   = template.Must(template.New("systemdLogs").Parse("journalctl {{.user}} -xe"))
+	quadletSchemas    map[string]map[string]SchemaOption
 )
 
 func assembleQuadletOptionsMap(options []SchemaOption) map[string]SchemaOption {
@@ -132,31 +141,48 @@ func GetPodmanOptionsMap(quadletType string) map[string]SchemaOption {
 
 func main() {
 
+	// Determine if running as root
+	if os.Geteuid() == 0 {
+		isRootful = true
+	}
+
 	// Read config
 	config, err := getConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading config: %v\n", err)
 		os.Exit(1)
 	}
-	if val, ok := config["install_subdirectory"]; ok && (val == "false" || val == "0") {
-		gInstallSubdirectory = false
+	if val, ok := config["use_subdirectories"]; ok && (val == "false" || val == "0") {
+		useSubdirectories = false
 	}
-	if val, ok := config["install_links"]; ok && (val == "false" || val == "0") {
-		gInstallLinks = false
+	if val, ok := config["use_symbolic_links"]; ok && (val == "true" || val == "1") {
+		useSymbolicLinks = true
 	}
-	if val, ok := config["reload-systemd"]; ok && (val == "false" || val == "0") {
-		gReloadSystemd = false
+	if val, ok := config["auto_reload_systemd"]; ok && (val == "false" || val == "0") {
+		isReloadSystemd = false
+	}
+	if val, ok := config["remove_volumes"]; ok && (val == "false" || val == "0") {
+		isRemoveVolumes = false
+	}
+	if val, ok := config["remove_networks"]; ok && (val == "false" || val == "0") {
+		isRemoveNetworks = false
+	}
+	if val, ok := config["quadlets_path"]; ok && val != "" {
+		quadletsPath = val
 	}
 
-	// Determine if running as root
-	if os.Geteuid() == 0 {
-		gRootful = true
-	}
+	isFile := false
 
 	// Handle flags
 	//rootfulOpt := flag.Bool("rootful", false, "Execute podman commands rootful (requires sudo/root access)")
-	dryRunOpt := flag.Bool("dry-run", false, "Print podman commands and warnings without executing")
-	verboseOpt := flag.Bool("verbose", false, "Print detailed information about command execution and warnings")
+	flag.BoolVar(&isPrintOnly, "print", false, "Print podman commands without executing")
+	flag.BoolVar(&isPrintOnly, "p", false, "Print podman commands without executing")
+	flag.BoolVar(&isVerbose, "verbose", false, "Print detailed information about command execution and warnings")
+	flag.BoolVar(&isVerbose, "v", false, "Print detailed information about command execution and warnings")
+	flag.BoolVar(&isFile, "file", false, "Specify that the provided path is a file rather than a directory (default: false)")
+	flag.BoolVar(&isFile, "f", false, "Specify that the provided path is a file rather than a directory (default: false)")
+	flag.BoolVar(&isSystemd, "systemd", false, "Use systemd for managing services (default: false)")
+	flag.BoolVar(&isSystemd, "s", false, "Use systemd for managing services (default: false)")
 
 	flag.Usage = printUsage
 	flag.Parse()
@@ -167,24 +193,42 @@ func main() {
 	}
 
 	subcommand := strings.ToLower(flag.Arg(0))
-	//gRootful = *rootfulOpt
-	gDryRun = *dryRunOpt
-	gVerbose = *verboseOpt
 
-	// 2. Determine search directory (optional path or CWD)
+	// 2. Determine search directory (optional path or CWD ... optional path may be relative to CWD or quadlets_path from config)
+	// If no path is specified, use the current working directory
 	searchDir, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting CWD: %v\n", err)
 		os.Exit(1)
 	}
+	// If a path is specified, determine if relative to CWD or quadlets_path
 	if flag.NArg() > 1 {
 		tmp := flag.Arg(1)
-		if info, err := os.Stat(tmp); err != nil || !info.IsDir() {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a directory\n", tmp)
-			os.Exit(1)
+		// If os.Stat returns no error, the path is absolute or valid relative to the current working directory
+		if info, err := os.Stat(tmp); err == nil {
+			//if a file was specified, get parent directory of the file
+			if !info.IsDir() {
+				searchDir = filepath.Dir(tmp)
+			} else {
+				searchDir, _ = filepath.Abs(tmp)
+			}
+			// Otherwise, look for specified directory path relative to the quadlets path
+		} else {
+			searchDir = filepath.Join(quadletsPath, tmp)
+			// If the path is not found relative to the quadlets path or is not a directory, it's an error
+			if info, err := os.Stat(searchDir); err == nil {
+				//if a file was specified, get parent directory of the file
+				if !info.IsDir() {
+					searchDir = filepath.Dir(tmp)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: %s not found\n", tmp)
+				os.Exit(1)
+			}
 		}
-		searchDir, _ = filepath.Abs(tmp)
 	}
+
+	fmt.Printf("searchDir: %s\n", searchDir)
 
 	//Get the schemas for each supported type
 	quadletSchemas = map[string]map[string]SchemaOption{}
@@ -201,12 +245,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Special check for .kube and YAML existence before sorting
 	for _, q := range quadlets {
+		// Special check for .kube and YAML existence before sorting
 		if q.Type == ".kube" && q.KubernetesYaml != "" {
 			if _, err := os.Stat(q.KubernetesYaml); os.IsNotExist(err) {
 				fmt.Fprintf(os.Stderr, "[WARN] %s: KubernetesYaml file not found: %s\n", q.Filepath, q.KubernetesYaml)
 			}
+		}
+	}
+
+	// If user specified the -f flag, the path provided should be a quadlet file, rather than directory. Only process the specified file and its dependencies.
+	var selectedQuadlets []*Quadlet
+	if isFile {
+		// If a file was specified, find the corresponding quadlet
+		tmp := strings.TrimSuffix(flag.Arg(1), filepath.Ext(flag.Arg(1)))
+		selected := quadlets[tmp]
+		if selected != nil {
+			selectedQuadlets = append(selectedQuadlets, selected)
+			if len(selected.Deps) > 0 {
+				// Add dependencies to the selected quadlets
+				for _, dep := range selected.Deps {
+					if depQuadlet := quadlets[dep]; depQuadlet != nil {
+						selectedQuadlets = append(selectedQuadlets, depQuadlet)
+					}
+				}
+			}
+			// Replace the original quadlets with the selected ones
+			selectedQuadletsMap := make(map[string]*Quadlet)
+			for _, q := range selectedQuadlets {
+				selectedQuadletsMap[q.ID] = q
+			}
+			quadlets = selectedQuadletsMap
 		}
 	}
 
@@ -223,16 +292,46 @@ func main() {
 		handlePS(ordered)
 	case "stats":
 		handleStats(ordered)
+	case "status":
+		if isSystemd {
+			fmt.Println("Calling systemd status")
+			handleSystemdStatus(ordered)
+		} else {
+			handlePS(ordered)
+		}
+	case "logs":
+		if isSystemd {
+			handleSystemdLogs(ordered)
+		} else {
+			fmt.Println("To view podman logs, use 'podman logs <container name or id>'")
+			os.Exit(0)
+		}
 	case "images":
 		handleImages(ordered)
 	case "create":
-		handleCreate(ordered)
+		if isSystemd {
+			handleInstall(ordered, searchDir)
+		} else {
+			handleCreate(ordered)
+		}
 	case "up":
-		handleUp(ordered)
+		if isSystemd {
+			handleSystemdStart(ordered, searchDir)
+		} else {
+			handleUp(ordered)
+		}
 	case "down":
-		handleDown(ordered)
+		if isSystemd {
+			handleSystemdStop(ordered)
+		} else {
+			handleDown(ordered)
+		}
 	case "remove":
-		handleRemove(ordered)
+		if isSystemd {
+			handleUninstall(ordered, searchDir)
+		} else {
+			handleRemove(ordered)
+		}
 	case "pull":
 		handlePull(quadlets)
 	case "install":
@@ -268,11 +367,22 @@ func printUsage() {
 func getConfig() (map[string]string, error) {
 
 	config = make(map[string]string)
-
-	path := os.Getenv("XDG_CONFIG_HOME")
-	if path == "" {
-		path = os.Getenv("HOME") + "/.config"
+	var path string
+	if isRootful {
+		path = os.Getenv("QUADCTL_CONFIG_DIR")
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			err = fmt.Errorf("Invalid config path: %s\nWhen running as root, ensure QUADCTL_CONFIG_DIR is set and points to a valid directory.\nTo set root config same as user:\n\necho \"QUADCTL_CONFIG_DIR=$HOME/.config/quadctl\" | sudo tee -a /etc/environment > /dev/null", path)
+			return nil, err
+		}
+	} else {
+		path = os.Getenv("XDG_CONFIG_HOME")
+		if path == "" {
+			path = os.Getenv("HOME") + "/.config"
+		}
+		path = filepath.Join(path, "quadctl")
 	}
+
+	path = filepath.Join(path, "quadctl.conf")
 
 	file, err := os.Open(path)
 	if err != nil {
@@ -303,15 +413,14 @@ func getConfig() (map[string]string, error) {
 // handleCreate generates and executes 'podman create' commands for all resources, but first checks if they exist and prints warnings if they do,
 // suggesting to run 'remove' first if intent is to re-create. It also handles special cases like .kube and auto-restart configuration warnings.
 func handleCreate(ordered []*Quadlet) {
+
 	//Collect all warnings and print them together to avoid interleaving with commands
 	warnings := []string{}
 	commands := [][]string{}
 
 	for _, q := range ordered {
-
 		//Only create if resource doesn't exist.
 		if !resourceExists(q.Type, q.ID) {
-
 			cmd, warns := generateCreateCommand(q)
 			for _, w := range warns {
 				warnings = append(warnings, fmt.Sprintf("[WARN] %s: %s\n", q.Filepath, w))
@@ -321,7 +430,7 @@ func handleCreate(ordered []*Quadlet) {
 			if q.RestartPolicy == "always" || q.RestartPolicy == "on-failure" {
 				restartWarning := fmt.Sprintln("# --- REMINDER: Auto Restart Configured ---")
 				restartWarning += fmt.Sprintln("# Ensure podman-restart.service is enabled on the host to use this feature.")
-				if gRootful {
+				if isRootful {
 					restartWarning += fmt.Sprintln("sudo systemctl enable --now podman-restart.service")
 				} else {
 					restartWarning += fmt.Sprintln("systemctl --user enable --now podman-restart.service")
@@ -337,7 +446,7 @@ func handleCreate(ordered []*Quadlet) {
 			commands = append(commands, cmd)
 
 		} else {
-			if gVerbose || gDryRun {
+			if isVerbose {
 				warnings = append(warnings, fmt.Sprintf(" [INFO] %s %s already exists. To force re-creation of ALL resources, run 'quadctl remove' first.\n", q.Type, q.ID))
 			}
 		}
@@ -348,20 +457,20 @@ func handleCreate(ordered []*Quadlet) {
 // Common handling for dry run / verbose output and command execution for all handlers that generate commands.
 func processCommands(commands [][]string, warnings []string) {
 
-	if gVerbose && len(warnings) > 0 {
+	if isVerbose && len(warnings) > 0 {
 		fmt.Println("\n# --- WARNINGS ---")
 		for _, w := range warnings {
 			fmt.Print(w)
 		}
 	}
-	if gDryRun && len(commands) > 0 {
+	if isPrintOnly && len(commands) > 0 {
 		fmt.Println("\n# --- DRY-RUN MODE: Commands that would be executed ---")
 		for _, c := range commands {
 			fmt.Printf("  %s\n", strings.Join(c, " "))
 		}
 	} else if len(commands) > 0 {
 		for _, c := range commands {
-			if gVerbose {
+			if isVerbose {
 				fmt.Printf("=> Executing: %s\n", strings.Join(c, " "))
 			}
 			//ToDo - Print indication of actions for starting and stopping so user can follow the flow.
@@ -410,6 +519,152 @@ func handleDown(ordered []*Quadlet) {
 		commands = append(commands, cmd)
 	}
 	processCommands(commands, warnings)
+}
+
+func handleSystemdReload() {
+	var buf bytes.Buffer
+	data := map[string]string{}
+	if !isRootful {
+		data["user"] = "--user"
+	}
+	err := systemdReloadTmpl.Execute(&buf, data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing systemd reload: %v\n", err)
+		os.Exit(1)
+	}
+	cmd := strings.Fields(buf.String())
+	_ = runCommand(cmd)
+}
+
+func listSystemdInstalledQuadlets(ordered []*Quadlet) ([][]string, error) {
+	cmd := []string{"podman", "quadlet", "list", "--format", "{{.Name}},{{.Path}},{{.Unit}},{{.Status}}"}
+	output, err := runCommandCapture(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(output, "\n")
+	var info [][]string
+	for _, line := range lines {
+		fmt.Println(line)
+		parts := strings.Split(line, ",")
+		if len(parts) < 4 {
+			continue
+		}
+		//filter for our quadlets
+		for _, q := range ordered {
+			name := filepath.Base(q.Filepath)
+			if strings.TrimSpace(parts[0]) == name {
+				info = append(info, parts)
+				break
+			}
+		}
+	}
+	return info, nil
+}
+
+func handleSystemdStart(ordered []*Quadlet, searchDir string) {
+	//Ideally, call handleInstall if needed. How to check if the required systemd services are installed?
+	/*
+		❯ sudo podman quadlet list
+		NAME                   UNIT NAME                    PATH ON DISK                                           STATUS      APPLICATION
+		homebox-app.container  homebox-app.service          /etc/containers/systemd/homebox/homebox-app.container  Not loaded
+		homebox-data.volume    homebox-data-volume.service  /etc/containers/systemd/homebox/homebox-data.volume    Not loaded
+		homebox.pod            homebox-pod.service          /etc/containers/systemd/homebox/homebox.pod            Not loaded
+	*/
+	info, _ := listSystemdInstalledQuadlets(ordered)
+	if len(info) < len(ordered) {
+		handleInstall(ordered, searchDir)
+	}
+
+	// Reload quadlet definitions
+	handleSystemdReload()
+
+	// Start the systemd services
+	var buf bytes.Buffer
+	data := map[string]string{}
+	if !isRootful {
+		data["user"] = "--user"
+	}
+	err := systemdStartTmpl.Execute(&buf, data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing systemd start: %v\n", err)
+		os.Exit(1)
+	}
+	// Only start the pod and any loose containers
+	for _, q := range ordered {
+		if q.Type == ".container" && q.ParentPod == "" {
+			cmd := strings.Fields(buf.String())
+			cmd = append(cmd, q.ServiceName)
+			_ = runCommand(cmd)
+		} else if q.Type == ".pod" {
+			cmd := strings.Fields(buf.String())
+			cmd = append(cmd, q.ServiceName)
+			_ = runCommand(cmd)
+		}
+		// Ignoring .kube for now. Will require special handling (it's create+start in one 'play' command)
+	}
+}
+
+func handleSystemdStop(ordered []*Quadlet) {
+	// Stop the systemd services
+	var buf bytes.Buffer
+	data := map[string]string{}
+	if !isRootful {
+		data["user"] = "--user"
+	}
+	err := systemdStopTmpl.Execute(&buf, data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing systemd stop: %v\n", err)
+		os.Exit(1)
+	}
+	// Only start the pod and any loose containers
+	for _, q := range ordered {
+		if q.Type == ".container" && q.ParentPod == "" {
+			cmd := strings.Fields(buf.String())
+			cmd = append(cmd, q.ServiceName)
+			_ = runCommand(cmd)
+		} else if q.Type == ".pod" {
+			cmd := strings.Fields(buf.String())
+			cmd = append(cmd, q.ServiceName)
+			_ = runCommand(cmd)
+		}
+		// Ignoring .kube for now. Will require special handling (it's create+start in one 'play' command)
+	}
+}
+
+func handleSystemdStatus(ordered []*Quadlet) {
+	var buf bytes.Buffer
+	data := map[string]string{}
+	if !isRootful {
+		data["user"] = "--user"
+	}
+	err := systemdStatusTmpl.Execute(&buf, data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing systemd status: %v\n", err)
+		os.Exit(1)
+	}
+
+	cmd := strings.Fields(buf.String())
+	for _, q := range ordered {
+		cmd = append(cmd, q.ServiceName)
+	}
+	_ = runCommand(cmd)
+}
+
+func handleSystemdLogs(ordered []*Quadlet) {
+	var buf bytes.Buffer
+	data := map[string]string{}
+	if !isRootful {
+		data["user"] = "--user"
+	}
+	err := systemdLogsTmpl.Execute(&buf, data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing systemd logs: %v\n", err)
+		os.Exit(1)
+	}
+	cmd := strings.Fields(buf.String())
+	_ = runCommand(cmd)
 }
 
 func handleRemove(ordered []*Quadlet) {
@@ -479,52 +734,49 @@ func handlePull(quadlets map[string]*Quadlet) {
 
 func handleInstall(ordered []*Quadlet, sourceDir string) {
 	var targetDir string
-	prefix := "--user"
+	//prefix := "--user"
 
-	if gRootful {
+	if isRootful {
 		targetDir = "/etc/containers/systemd"
-		prefix = ""
+		//prefix = ""
 	} else {
 		targetDir = filepath.Join(os.Getenv("HOME"), ".config/containers/systemd")
 	}
 
-	serviceNames := []string{}
-	for _, q := range ordered {
-		ext := filepath.Ext(q.Filepath)
-		if ext == ".kube" {
-			fmt.Fprintf(os.Stderr, "[INFO] .kube installs use the generic `podman-kube@` service\n")
-			continue
-		}
-		if ext == ".volume" || ext == ".network" {
-			continue
-		}
-		// Convert myapp.container to myapp.service
-		name := strings.TrimSuffix(filepath.Base(q.Filepath), ext)
-		if q.Type == ".pod" {
-			name += "-pod"
-		}
-		svc := name + ".service"
-		serviceNames = append(serviceNames, svc)
-	}
+	/*
+		serviceNames := []string{}
+		for _, q := range ordered {
+			ext := filepath.Ext(q.Filepath)
+			if ext == ".kube" {
+				fmt.Fprintf(os.Stderr, "[INFO] .kube installs use the generic `podman-kube@` service\n")
+				continue
+			}
+			if ext == ".volume" || ext == ".network" {
+				continue
+			}
 
-	reloadCmd := []string{"systemctl", prefix, "daemon-reload"}
-	var startCmd []string
-	if len(serviceNames) > 0 {
-		startCmd = append(startCmd, "systemctl", prefix, "start")
-		startCmd = append(startCmd, serviceNames...)
-	}
+			svc := q.ServiceName + ".service"
+			serviceNames = append(serviceNames, svc)
+		}
 
-	if gDryRun {
+		//reloadCmd := []string{"systemctl", prefix, "daemon-reload"}
+		var startCmd []string
+		if len(serviceNames) > 0 {
+			startCmd = append(startCmd, "systemctl", prefix, "start")
+			startCmd = append(startCmd, serviceNames...)
+		}
+	*/
+	if isPrintOnly {
 		fmt.Printf("=> [DRY-RUN] Would install quadlets to: %s\n", targetDir)
-		if gInstallSubdirectory {
-			if gInstallLinks {
+		if useSubdirectories {
+			if useSymbolicLinks {
 				fmt.Printf("  Would create symbolic link: %s -> %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)), sourceDir)
 			} else {
 				fmt.Printf("  Would copy files to: %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)))
 			}
 			return
 		} else {
-			if gInstallLinks {
+			if useSymbolicLinks {
 				for _, q := range ordered {
 					dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
 					fmt.Printf("  Would create symbolic link: %s -> %s\n", dest, q.Filepath)
@@ -536,29 +788,32 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 				}
 			}
 		}
-		if gReloadSystemd {
-			fmt.Printf("  Would reload systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
-		}
 		return
 	}
 
-	fmt.Printf("=> Installing quadlets to: %s\n", targetDir)
+	if isVerbose {
+		fmt.Printf("=> Installing quadlets to: %s\n", targetDir)
+	}
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating target directory: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Use links if configured to do so
-	if gInstallLinks {
-		fmt.Println("Using symbolic links for installation.")
-		if gInstallSubdirectory {
+	if useSymbolicLinks {
+		if isVerbose {
+			fmt.Println("Using symbolic links for installation.")
+		}
+		if useSubdirectories {
 			// Link the entire source directory as a subdirectory in the target location to keep related quadlets together
 			os.Symlink(sourceDir, filepath.Join(targetDir, filepath.Base(sourceDir)))
 		} else {
 			// Link the individual quadlet files directly into the target location
 			for _, q := range ordered {
 				dest := filepath.Join(targetDir, filepath.Base(q.Filepath))
-				fmt.Printf(" Linking %s to %s\n", q.Filepath, dest)
+				if isVerbose {
+					fmt.Printf(" Linking %s to %s\n", q.Filepath, dest)
+				}
 				if err := os.Symlink(q.Filepath, dest); err != nil {
 					fmt.Fprintf(os.Stderr, " Failed to link: %v\n", err)
 				}
@@ -567,7 +822,9 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 				dropInDir := q.Filepath + ".d"
 				if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
 					destDropIn := dest + ".d"
-					fmt.Printf(" Linking directory %s to %s\n", dropInDir, destDropIn)
+					if isVerbose {
+						fmt.Printf(" Linking directory %s to %s\n", dropInDir, destDropIn)
+					}
 					if err := os.Symlink(dropInDir, destDropIn); err != nil {
 						fmt.Fprintf(os.Stderr, "  Failed to link dir: %v\n", err)
 					}
@@ -588,7 +845,7 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 		}
 
 		// If the user configured to use a subdirectory to organize quadlets, we create the directory and move files after podman quadlet install step.
-		if gInstallSubdirectory {
+		if useSubdirectories {
 
 			//Create the subdirectory at target location
 			dest := filepath.Join(targetDir, filepath.Base(sourceDir))
@@ -601,7 +858,9 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 			for _, q := range ordered {
 				src := filepath.Join(targetDir, filepath.Base(q.Filepath))
 				dest := filepath.Join(targetDir, filepath.Base(sourceDir), filepath.Base(q.Filepath))
-				fmt.Printf(" Moving %s to %s\n", src, dest)
+				if isVerbose {
+					fmt.Printf(" Moving %s to %s\n", src, dest)
+				}
 				if err := os.Rename(src, dest); err != nil {
 					fmt.Fprintf(os.Stderr, " Failed to move: %v\n", err)
 				}
@@ -613,47 +872,38 @@ func handleInstall(ordered []*Quadlet, sourceDir string) {
 			if info, err := os.Stat(dropInDir); err == nil && info.IsDir() {
 
 				// Set dropInDir
-				if gInstallSubdirectory {
+				if useSubdirectories {
 					destDropIn = filepath.Join(targetDir, filepath.Base(sourceDir), filepath.Base(q.Filepath)+".d")
 				} else {
 					destDropIn = filepath.Join(targetDir, filepath.Base(q.Filepath)+".d")
 				}
-				fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
+				if isVerbose {
+					fmt.Printf(" Copying directory %s to %s\n", dropInDir, destDropIn)
+				}
 				if err := copyDir(dropInDir, destDropIn); err != nil {
 					fmt.Fprintf(os.Stderr, "  Failed to copy dir: %v\n", err)
 				}
 			}
 		}
 	}
-
-	if gReloadSystemd {
-		fmt.Printf("\n=> Reloading systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
-		_ = runCommand(reloadCmd)
-	}
-	fmt.Println("\n# --- SYSTEMD INSTRUCTIONS ---")
-	fmt.Println("# Quadlets installed. Execute the following commands to enable via systemd:")
-	if !gReloadSystemd {
-		fmt.Printf("\n%s\n", strings.Join(reloadCmd, " "))
-	}
-	fmt.Printf("\n%s\n", strings.Join(startCmd, " "))
 }
 
 func handleUninstall(ordered []*Quadlet, sourceDir string) {
 	var targetDir string
-	prefix := "--user"
-	if gRootful {
+	//prefix := "--user"
+	if isRootful {
 		targetDir = "/etc/containers/systemd"
-		prefix = ""
+		//prefix = ""
 	} else {
 		targetDir = filepath.Join(os.Getenv("HOME"), ".config/containers/systemd")
 	}
 
-	reloadCmd := []string{"systemctl", prefix, "daemon-reload"}
+	//reloadCmd := []string{"systemctl", prefix, "daemon-reload"}
 
-	if gDryRun {
+	if isPrintOnly {
 		fmt.Printf("=> [DRY-RUN] Would uninstall quadlets from: %s\n", targetDir)
-		if gInstallLinks {
-			if gInstallSubdirectory {
+		if useSymbolicLinks {
+			if useSubdirectories {
 				fmt.Printf("  Would remove symbolic link: %s -> %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)), sourceDir)
 			} else {
 				for _, q := range ordered {
@@ -663,7 +913,7 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 			}
 			return
 		} else {
-			if gInstallSubdirectory {
+			if useSubdirectories {
 				fmt.Printf("  Would remove directory and all files from: %s\n", filepath.Join(targetDir, filepath.Base(sourceDir)))
 			} else {
 				for _, q := range ordered {
@@ -672,16 +922,13 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 				}
 			}
 		}
-		if gReloadSystemd {
-			fmt.Printf("  Would reload systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
-		}
 		return
 	}
 
 	//If targetDir exists, remove files.
 	if info, err := os.Stat(targetDir); err == nil && info.IsDir() {
-		if gInstallLinks {
-			if gInstallSubdirectory {
+		if useSymbolicLinks {
+			if useSubdirectories {
 				//remove link to directory
 				_ = os.Remove(filepath.Join(targetDir, filepath.Base(sourceDir)))
 			} else {
@@ -706,20 +953,18 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 			cmd := []string{"podman", "quadlet", "rm", filepath.Base(ordered[0].Filepath)}
 			_ = runCommandSilently(cmd)
 			// podman quadlet install does not recognize the subdirectory, so we have to remove it separately after quadlets are removed.
-			if gInstallSubdirectory {
+			if useSubdirectories {
 				//remove directory and all files within
 				_ = os.RemoveAll(filepath.Join(targetDir, filepath.Base(sourceDir)))
 			}
 		}
-		if gReloadSystemd {
-			fmt.Printf("\n=> Reloading systemd to apply changes: %s\n", strings.Join(reloadCmd, " "))
-			_ = runCommand(reloadCmd)
-		}
 
 		//Expressly remove volume and network resources that might be left behind
 		for _, q := range ordered {
-			if q.Type == ".volume" && gUninstallRemoveVolumes {
-				fmt.Printf("=> Removing volume %s...\n", q.ID)
+			if q.Type == ".volume" && isRemoveVolumes {
+				if isVerbose {
+					fmt.Printf("=> Removing volume %s...\n", q.ID)
+				}
 				//Default name has systemd- prefix. If non-default name was specified, use it, otherwise use default prefix.
 				if volName := q.Sections["Volume"]["VolumeName"]; volName != nil {
 					_ = runCommand([]string{"podman", "volume", "rm", "-f", "systemd-" + volName[0]})
@@ -727,8 +972,10 @@ func handleUninstall(ordered []*Quadlet, sourceDir string) {
 					_ = runCommand([]string{"podman", "volume", "rm", "-f", "systemd-" + q.ID})
 				}
 			}
-			if q.Type == ".network" && gUninstallRemoveNetworks {
-				fmt.Printf("=> Removing network %s...\n", q.ID)
+			if q.Type == ".network" && isRemoveNetworks {
+				if isVerbose {
+					fmt.Printf("=> Removing network %s...\n", q.ID)
+				}
 				//Default name has systemd- prefix. If non-default name was specified, use it, otherwise use default prefix.
 				if networkName := q.Sections["Network"]["NetworkName"]; networkName != nil {
 					_ = runCommand([]string{"podman", "network", "rm", "-f", "systemd-" + networkName[0]})
@@ -901,13 +1148,43 @@ func parseQuadlet(path string) (*Quadlet, error) {
 		GeneratedNames: make(map[string]string),
 	}
 
-	// Defaults based on extension
-	if ext == ".container" {
-		q.GeneratedNames["container"] = id
-	}
-
 	if err := parseIniFile(path, q); err != nil {
 		return nil, err
+	}
+
+	// Set service name ... For container, use ServiceName if provided, otherwise {id}. For others, ServiceName or {id}-{type}
+	var confServiceName string
+	switch q.Type {
+	case ".container":
+		q.GeneratedNames["container"] = id
+		vals := q.Sections["Container"]["ServiceName"]
+		if len(vals) > 0 {
+			confServiceName = vals[0]
+		}
+	case ".pod":
+		vals := q.Sections["Pod"]["ServiceName"]
+		if len(vals) > 0 {
+			confServiceName = vals[0]
+		}
+	case ".volume":
+		vals := q.Sections["Volume"]["ServiceName"]
+		if len(vals) > 0 {
+			confServiceName = vals[0]
+		}
+	case ".network":
+		vals := q.Sections["Network"]["ServiceName"]
+		if len(vals) > 0 {
+			confServiceName = vals[0]
+		}
+	}
+	if confServiceName == "" {
+		if q.Type == ".container" {
+			q.ServiceName = id
+		} else {
+			q.ServiceName = id + "-" + strings.TrimPrefix(q.Type, ".")
+		}
+	} else {
+		q.ServiceName = confServiceName
 	}
 
 	// Merge systemd-style drop-ins from filename.d/*.conf
@@ -1437,23 +1714,25 @@ func runCommand(args []string) error {
 	if len(args) == 0 {
 		return nil
 	}
-	if gRootful && args[0] != "sudo" {
-		args = append([]string{"sudo"}, args...)
-	}
+	//if isRootful && args[0] != "sudo" {
+	//	args = append([]string{"sudo"}, args...)
+	//}
+	fmt.Printf("=> Running command: %s\n", strings.Join(args, " "))
+
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, " [ERROR] Command failed: %s\n", strings.Join(args, " "))
+		fmt.Fprintf(os.Stderr, " [ERROR] Command failed: '%s'. Error: %v\n", strings.Join(args, " "), err)
 	}
 	return err
 }
 
 func runCommandSilently(args []string) error {
-	if gRootful && args[0] != "sudo" {
-		args = append([]string{"sudo"}, args...)
-	}
+	//if isRootful && args[0] != "sudo" {
+	//	args = append([]string{"sudo"}, args...)
+	//}
 	cmd := exec.Command(args[0], args[1:]...)
 	// Discard output
 	err := cmd.Run()
@@ -1461,9 +1740,9 @@ func runCommandSilently(args []string) error {
 }
 
 func runCommandCapture(args []string) (string, error) {
-	if gRootful && args[0] != "sudo" {
-		args = append([]string{"sudo"}, args...)
-	}
+	//if isRootful && args[0] != "sudo" {
+	//	args = append([]string{"sudo"}, args...)
+	//}
 
 	//fmt.Printf("=> Running command: %s\n", strings.Join(args, " "))
 
@@ -1552,9 +1831,9 @@ func handleStats(ordered []*Quadlet) {
 		cmd = append(cmd, id)
 	}
 
-	if gRootful {
-		cmd = append([]string{"sudo"}, cmd...)
-	}
+	//if isRootful {
+	//	cmd = append([]string{"sudo"}, cmd...)
+	//}
 
 	err = runCommand(cmd)
 	if err != nil {
@@ -1564,36 +1843,66 @@ func handleStats(ordered []*Quadlet) {
 
 func handleImages(ordered []*Quadlet) {
 
+	//REPOSITORY                                 TAG         IMAGE ID      CREATED       SIZE
+	cmd := []string{"podman", "images", "--noheading", "--filter", "reference=ADD_ID_HERE", "--format", "{{.Repository}},{{.Tag}},{{.ID}},{{.Created}},{{.Size}}"}
+	imageInfo := [][]string{}
+
+	// Fetch image info for each container
 	psInfo, err := getContainerPS(ordered)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-
-	//REPOSITORY                                 TAG         IMAGE ID      CREATED       SIZE
-	cmd := []string{"podman", "images", "--noheading", "--filter", "reference=ADD_ID_HERE", "--format", "{{.Repository}},{{.Tag}},{{.ID}},{{.Created}},{{.Size}}"}
-	imageInfo := [][]string{}
-
-	for _, info := range psInfo {
-		name := strings.TrimSpace(info[5]) // IMAGE ID from ps output
-		if len(name) < 12 {
-			continue
+	if len(psInfo) > 0 {
+		for _, info := range psInfo {
+			name := strings.TrimSpace(info[5]) // IMAGE ID from ps output
+			if len(name) < 12 {
+				continue
+			}
+			cmd[4] = "reference=" + name
+			output, err := runCommandCapture(cmd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error fetching image info for container %s: %v\n", info[0], err)
+				continue
+			}
+			lines := strings.Split(output, "\n")
+			for _, line := range lines {
+				parts := strings.Split(line, ",")
+				if len(parts) >= 5 {
+					imageInfo = append(imageInfo, parts)
+				}
+			}
 		}
-		cmd[4] = "reference=" + name
-		output, err := runCommandCapture(cmd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error fetching image info for container %s: %v\n", info[0], err)
-			continue
-		}
-		lines := strings.Split(output, "\n")
-		for _, line := range lines {
-			parts := strings.Split(line, ",")
-			if len(parts) >= 5 {
-				imageInfo = append(imageInfo, parts)
+	} else {
+		// If no containers are found, we can still fetch image info for the quadlet files
+		fmt.Fprintf(os.Stderr, "No containers found, fetching image info from quadlet files...\n")
+		for _, q := range ordered {
+			// Images only pertain to containers and Kubernetes resources. Ignoring .kube for now...
+			if q.Type == ".container" {
+				if imgSec, ok := q.Sections["Container"]; ok {
+					if imgList, ok := imgSec["Image"]; ok && len(imgList) > 0 {
+						name := strings.TrimSpace(imgList[0]) // IMAGE ID from quadlet file
+						if len(name) < 12 {
+							continue
+						}
+						cmd[4] = "reference=" + name
+						output, err := runCommandCapture(cmd)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "Error fetching image info for quadlet %s: %v\n", q.ID, err)
+							continue
+						}
+						lines := strings.Split(output, "\n")
+						for _, line := range lines {
+							parts := strings.Split(line, ",")
+							if len(parts) >= 5 {
+								imageInfo = append(imageInfo, parts)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
-
 	t := table.NewWriter()
 	t.SetOutputMirror(os.Stdout)
 	t.AppendHeader(table.Row{"REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"})
