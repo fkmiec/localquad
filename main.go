@@ -16,6 +16,7 @@ import (
 
 	"github.com/briandowns/spinner"
 	. "github.com/fkmiec/quadctl/schema"
+	"github.com/jedib0t/go-pretty/v6/list"
 	"github.com/jedib0t/go-pretty/v6/table"
 )
 
@@ -236,6 +237,8 @@ func main() {
 		}
 	case "pull":
 		handlePull(ordered)
+	case "list", "ls":
+		handleList()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", subcommand)
 		printUsage()
@@ -249,12 +252,14 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "Flags:\n")
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "\nCommands:\n")
-	fmt.Fprintf(os.Stderr, "  pull    : Pull required images\n")
-	fmt.Fprintf(os.Stderr, "  create  : Create resources (force re-creation), do not start. Use -s flag to generate quadlets.\n")
-	fmt.Fprintf(os.Stderr, "  start   : Create (if missing) and start services. Use -s flag to start containers with systemd.\n")
-	fmt.Fprintf(os.Stderr, "  stop    : Stop running services (do not remove). Use -s flag to stop containers run by systemd.\n")
-	fmt.Fprintf(os.Stderr, "  remove  : Remove stopped resources. Use -s flag to remove generated quadlets.\n")
-	fmt.Fprintf(os.Stderr, "  status  : Show current status. Use -s flag to see systemd status.\n")
+	fmt.Fprintf(os.Stderr, "  pull     : Pull required images\n")
+	fmt.Fprintf(os.Stderr, "  create   : Create resources (force re-creation), do not start. Use -s flag to generate quadlets.\n")
+	fmt.Fprintf(os.Stderr, "  start    : Create (if missing) and start services. Use -s flag to start containers with systemd.\n")
+	fmt.Fprintf(os.Stderr, "  stop     : Stop running services (do not remove). Use -s flag to stop containers run by systemd.\n")
+	fmt.Fprintf(os.Stderr, "  remove   : Remove stopped resources. Use -s flag to remove generated quadlets.\n")
+	fmt.Fprintf(os.Stderr, "  status   : Show current status. Use -s flag to see systemd status.\n")
+	fmt.Fprintf(os.Stderr, "  logs     : Show logs of running containers. Use -s flag to view systemd logs.\n")
+	fmt.Fprintf(os.Stderr, "  list, ls : List quadlets in the configured quadlet_path or systemd path if -s flag is used.\n")
 	fmt.Fprintf(os.Stderr, "\nWrapper commands (filtered to defined resources):\n")
 	fmt.Fprintf(os.Stderr, "  ps, stats, images\n")
 
@@ -1257,6 +1262,70 @@ func handleImages(ordered []*Quadlet) {
 	}
 	t.SetStyle(table.StyleColoredYellowWhiteOnBlack)
 	t.Render()
+}
+
+func handleList() error {
+
+	absPath := quadletSrcPath
+	if isSystemd {
+		if isRootful {
+			absPath = quadletRootPath
+		} else {
+			absPath = quadletUserPath
+		}
+	}
+
+	// Verify the path exists and is a directory
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat path: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("provided path is not a directory")
+	}
+
+	lw := list.NewWriter()
+	lw.SetStyle(list.StyleConnectedRounded)
+
+	// Append the root directory name
+	lw.AppendItem(absPath)
+
+	// Start recursive rendering (root is level 1, its children are level 2)
+	lw.Indent()
+	err = appendDirItems(lw, absPath, 2)
+	if err != nil {
+		return err
+	}
+	lw.UnIndent()
+
+	// Output the rendered list
+	fmt.Println(lw.Render())
+	return nil
+}
+
+// appendDirItems recursively traverses the directory and adds items to the list writer.
+func appendDirItems(lw list.Writer, currentPath string, level int) error {
+	entries, err := os.ReadDir(currentPath)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		// Add the current file or directory to the list
+		lw.AppendItem(entry.Name())
+
+		// Nest deeper if it's a directory
+		lw.Indent()
+		if entry.IsDir() {
+			nextPath := filepath.Join(currentPath, entry.Name())
+			if err := appendDirItems(lw, nextPath, level+1); err != nil {
+				return err
+			}
+		}
+		lw.UnIndent()
+	}
+
+	return nil
 }
 
 // --- PARSING AND GENERATION LOGIC ---
